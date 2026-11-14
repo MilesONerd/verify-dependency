@@ -25,8 +25,8 @@ Nothing is installed, and nothing is written to your real manifest or lockfile, 
 | Part | What it does |
 |---|---|
 | `skills/verify-dependency/SKILL.md` | The instructions the agent follows: the approval rule, the verification steps, how to read the signals, the report format. |
-| `scripts/check_dep.py` | Deterministic verifier (Python standard library only). Queries the registry, cross-checks the repository, returns JSON with `signals` and `flags`. |
-| `scripts/diff_lock.py` | Compares lockfiles and lists added, changed and removed dependencies, including transitive ones, and can verify the added ones in bulk. |
+| `skills/verify-dependency/scripts/check_dep.py` | Deterministic verifier (Python standard library only). Queries the registry, cross-checks the repository, returns JSON with `signals` and `flags`. |
+| `skills/verify-dependency/scripts/diff_lock.py` | Compares lockfiles and lists added, changed and removed dependencies, including transitive ones, and can verify the added ones in bulk. |
 
 Supported ecosystems: npm, PyPI, crates.io, RubyGems, NuGet, Go, Packagist, Maven, Hex, pub.dev, AUR.
 Lockfiles read by `diff_lock.py`: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (best effort), `Cargo.lock`,
@@ -37,10 +37,12 @@ reports (`pip install --dry-run --report`).
 
 Non-existent names, packages replaced by registry security placeholders, repositories that do not exist, names
 that collide with built-in modules (`npm install path`), names close to popular packages, new packages with little
-adoption, install scripts, forks, manifest/repository name mismatches, orphaned AUR packages, and, as
+adoption, install scripts, forks, manifest/repository name mismatches (automated for npm, crates.io and PyPI only; the report says "not checked" for the rest), orphaned AUR packages, and, as
 informational flags, stale, archived or deprecated projects.
 
 ### What it does **not** promise
+
+The name-similarity check uses a small built-in list of popular packages, so a missing `SIMILAR_TO_POPULAR` flag does not clear a name.
 
 Signals are **indicators, not proof**. Stars, downloads, activity and reputation can be faked, and a legitimate
 package can be compromised later. The result `no_alerts` means "no automatic alerts", never "safe". The skill tells

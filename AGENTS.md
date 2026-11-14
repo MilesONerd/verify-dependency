@@ -10,8 +10,9 @@ Edit this file, never those.
 hallucinated or malicious dependencies (slopsquatting). It has two parts:
 
 - Instructions: `skills/verify-dependency/SKILL.md`.
-- A deterministic verifier in Python, standard library only: `scripts/check_dep.py` (one dependency)
-  and `scripts/diff_lock.py` (lockfile diff, including transitive dependencies).
+- A deterministic verifier in Python, standard library only: `skills/verify-dependency/scripts/check_dep.py`
+  (one dependency) and `skills/verify-dependency/scripts/diff_lock.py` (lockfile diff, including transitive
+  dependencies).
 
 ## Repository layout
 
@@ -44,6 +45,8 @@ Run the offline tests and `tools/package.py` before every commit.
 - Scripts print JSON on stdout. Keep the exit codes: `check_dep.py` 0 found, 1 not found, 2 error;
   `diff_lock.py` 0 ok, 2 error.
 - A network failure must surface as `error`, never as `not_found` and never as `no_alerts`.
+- Every command shown in `AGENTS.md` and `README.md` must run from the repository root, with full paths.
+  Inside `SKILL.md`, script paths are written as `<skill-dir>/scripts/...`. `tests/test_docs.py` enforces both.
 - Do not remove existing checks. Adding a flag means adding a test and a row in the flag table in `SKILL.md`.
 - Flag levels: `high` and `medium` change `signals`; `maintenance` and `info` do not.
 

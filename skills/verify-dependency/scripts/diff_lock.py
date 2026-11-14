@@ -37,8 +37,9 @@ def norm_py(n):
 
 
 class Lock:
-    def __init__(self, eco):
+    def __init__(self, eco, structured=False):
         self.eco = eco
+        self.structured = structured  # True when the format is JSON: a successful parse with zero packages is a real result
         self.pkgs = {}   # name -> set(versions)
         self.notes = {}  # name -> [notes]
 
@@ -54,7 +55,7 @@ class Lock:
 
 # ---------- parsers ----------
 def p_npm_lock(text):
-    L = Lock("npm")
+    L = Lock("npm", structured=True)
     d = json.loads(text)
     if d.get("packages"):
         for path, v in d["packages"].items():
@@ -85,17 +86,21 @@ def p_yarn(text):
         if not lines or lines[0].startswith(("__metadata", " ")):
             continue
         spec = lines[0].rstrip(":").split(",")[0].strip().strip('"')
-        if "@" not in spec[1:]:
-            continue
-        name = spec.rsplit("@", 1)[0]
+        at = spec.find("@", 1)  # first '@' after the optional scope marker
+        if at < 0 or re.search(r"@(workspace|link|portal):", spec):
+            continue  # not a registry package (berry workspaces and local links)
+        name = spec[:at]
         m = re.search(r'^\s+version:? "?([^"\s]+)"?', block, re.M)
-        if m and name:
+        if m and name and not m.group(1).startswith("0.0.0-use.local"):
             L.add(name, m.group(1))
     return L
 
 
 def p_pnpm(text):
+    """pnpm-lock.yaml. v5 keys look like '/name/1.0.0_peer@1', v6 like '/name@1.0.0(peer@1)', v9 like 'name@1.0.0'."""
     L = Lock("npm")
+    m = re.search(r"^lockfileVersion:\s*['\"]?(\d+)", text, re.M)
+    major = int(m.group(1)) if m else 9
     in_pk = False
     for line in text.splitlines():
         if re.match(r"^packages:\s*$", line):
@@ -103,10 +108,14 @@ def p_pnpm(text):
             continue
         if in_pk and re.match(r"^\S", line):
             in_pk = False
-        if in_pk:
-            m = re.match(r"^  '?/?(@?[^@\s'/]+(?:/[^@\s'/]+)?)@(\d[^:\s'()]*)", line)
-            if m:
-                L.add(m.group(1), m.group(2))
+        if not in_pk:
+            continue
+        if major <= 5:
+            mm = re.match(r"^  /(@[^/\s:]+/[^/\s:]+|[^/\s:@]+)/(\d[^:\s_(]*)", line)
+        else:
+            mm = re.match(r"^  '?/?(@[^@\s'/]+/[^@\s'/]+|[^@\s'/]+)@(\d[^:\s'()]*)", line)
+        if mm:
+            L.add(mm.group(1), mm.group(2))
     return L
 
 
@@ -155,7 +164,7 @@ def p_gosum(text):
 
 
 def p_composer(text):
-    L = Lock("packagist")
+    L = Lock("packagist", structured=True)
     d = json.loads(text)
     for key in ("packages", "packages-dev"):
         for p in d.get(key) or []:
@@ -174,7 +183,7 @@ def p_gemfile(text):
 
 def p_pip_report(text):
     """Report from `pip install --dry-run --report FILE ...` (JSON with an "install" key)."""
-    L = Lock("pypi")
+    L = Lock("pypi", structured=True)
     d = json.loads(text)
     if "install" not in d:
         raise ValueError("JSON without an 'install' key (not a pip report)")
@@ -224,28 +233,57 @@ def diff(old, new):
     return added, removed, changed
 
 
+def _git(args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=30)
+
+
 def git_show(path, ref):
+    """Returns (text, error). text is None with no error when the file does not exist at ref."""
     d, b = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
     try:
-        r = subprocess.run(["git", "show", f"{ref}:./{b}"], cwd=d, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return r.stdout if r.returncode == 0 else None
+        inside = _git(["rev-parse", "--is-inside-work-tree"], d)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None, "not inside a git repository"
+        if _git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], d).returncode != 0:
+            return None, f"unknown git ref: {ref}"
+        r = _git(["show", f"{ref}:./{b}"], d)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"git is not available: {e}"
+    return (r.stdout if r.returncode == 0 else None), None
+
+
+def fail(msg):
+    print(json.dumps({"status": "error", "error": msg}, ensure_ascii=False))
+    sys.exit(2)
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        fail(f"cannot read {path}: {e}")
 
 
 def parse_old(text, parse, alt_parse, eco):
-    """Reads the old lockfile with the new file's parser; if that fails or comes back empty, tries the parser matching the old file's name."""
+    """Reads the old lockfile with the new file's parser; if that fails or finds nothing in an unstructured
+    format, tries the parser matching the old file's name. An empty JSON lockfile is a valid result."""
     if not text.strip():
         return Lock(eco)
     first = None
     try:
         first = parse(text)
-        if first.pkgs:
+        if first.pkgs or first.structured:
             return first
     except ValueError:
         pass
     if alt_parse and alt_parse is not parse:
-        return alt_parse(text)
+        try:
+            return alt_parse(text)
+        except ValueError:
+            if first is not None:
+                return first
+            raise
     return first or Lock(eco)
 
 
@@ -297,15 +335,17 @@ def main():
         if len(pos) != 1:
             print(__doc__); sys.exit(2)
         new_path = pos[0]
-        old_text = git_show(new_path, base)
-        new_text = open(new_path, encoding="utf-8").read()
+        new_text = read_text(new_path)
+        old_text, err = git_show(new_path, base)
+        if err:
+            fail(err)
         old_missing = old_text is None
         old_text = old_text or ""
     else:
         if len(pos) != 2:
             print(__doc__); sys.exit(2)
         old_path, new_path = pos
-        old_text, new_text, old_missing = open(old_path, encoding="utf-8").read(), open(new_path, encoding="utf-8").read(), False
+        old_text, new_text, old_missing = read_text(old_path), read_text(new_path), False
         old_parse = parser_for(old_path)  # only used as a fallback (see parse_old)
 
     parse = parser_for(new_path)
@@ -325,6 +365,13 @@ def main():
     added, removed, changed = diff(old, new)
     res = {"status": "ok", "ecosystem": new.eco, "lockfile": os.path.basename(new_path),
            "summary": {"added": len(added), "removed": len(removed), "changed": len(changed)}}
+    warnings = []
+    if new_text.strip() and not new.pkgs and not new.structured:
+        warnings.append("parsed 0 packages from a non-empty new lockfile: it may have no dependencies, or this format version is unsupported")
+    if old_text.strip() and not old.pkgs and not old.structured:
+        warnings.append("parsed 0 packages from a non-empty old lockfile: the comparison may be incomplete")
+    if warnings:
+        res["parse_warning"] = warnings
     if old_missing:
         res["note"] = f"lockfile not found at {base}: all dependencies appear as added."
     if os.path.basename(new_path).lower() == "pnpm-lock.yaml":

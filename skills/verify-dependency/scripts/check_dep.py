@@ -373,6 +373,18 @@ def manifest_matches(eco, owner, repo, directory, pkg):
     return None if not found else (norm(found) == norm(pkg))
 
 
+MANIFEST_ECOSYSTEMS = ("npm", "crates", "pypi")
+
+
+def manifest_fields(eco, owner, repo, directory, pkg):
+    """Tri-state manifest cross-check: match / mismatch / inconclusive / not_supported (never an ambiguous None alone)."""
+    if eco not in MANIFEST_ECOSYSTEMS:
+        return {"manifest_name_matches": None, "manifest_check": "not_supported"}
+    m = manifest_matches(eco, owner, repo, directory, pkg)
+    return {"manifest_name_matches": m,
+            "manifest_check": "inconclusive" if m is None else ("match" if m else "mismatch")}
+
+
 def gh_check(info, eco, pkg):
     url = info.get("repo")
     if not url:
@@ -402,7 +414,7 @@ def gh_check(info, eco, pkg):
             out["status"] = "not_found"
             return out
         out["status"] = "limited"
-        out["manifest_name_matches"] = manifest_matches(eco, owner, repo, info.get("repo_dir"), pkg)
+        out.update(manifest_fields(eco, owner, repo, info.get("repo_dir"), pkg))
         out["note"] = ("GitHub API unavailable or rate-limited (set GITHUB_TOKEN). The repository EXISTS (checked via the HTML page), "
                        "but stars, activity and fork/archived status were NOT verified: open the repository to complete the check.")
         return out
@@ -413,7 +425,8 @@ def gh_check(info, eco, pkg):
     out.update(status="ok", full_name=d.get("full_name"), stars=d.get("stargazers_count"),
                archived=d.get("archived"), is_fork=d.get("fork"), pushed_at=iso(to_dt(d.get("pushed_at"))),
                repo_created=iso(to_dt(d.get("created_at"))), description=d.get("description"),
-               license=lic.get("spdx_id"), manifest_name_matches=manifest_matches(eco, owner, repo, info.get("repo_dir"), pkg))
+               license=lic.get("spdx_id"))
+    out.update(manifest_fields(eco, owner, repo, info.get("repo_dir"), pkg))
     return out
 
 
@@ -466,6 +479,10 @@ def evaluate(eco, name, info, gh):
         if st == "limited" and gh.get("manifest_name_matches") is False:
             add("medium", "REPO_MANIFEST_MISMATCH", "the manifest at the repository root declares a different name (could be a monorepo; check)")
         add("info", "REPO_UNVERIFIED", gh.get("note") or gh.get("error") or "repository not verified automatically")
+    if st in ("ok", "limited") and gh.get("manifest_check") == "not_supported":
+        add("info", "MANIFEST_NOT_CHECKED", "the repository manifest cross-check is only automated for npm, crates.io and PyPI: the package name was NOT compared with the repository")
+    elif st in ("ok", "limited") and gh.get("manifest_check") == "inconclusive":
+        add("info", "MANIFEST_NOT_CHECKED", "the repository manifest could not be read or has no package name (monorepo, setup.py, workspace root): the package name was NOT compared with the repository")
     if name.lower() in stdlib_names(eco) or norm(name) in stdlib_names(eco):
         add("medium", "STDLIB_NAME_COLLISION",
             f"the name matches a built-in {'Node' if eco == 'npm' else 'Python'} module: you probably need to install nothing, and the third-party package with this name is NOT the built-in module")

@@ -5,7 +5,7 @@ license: Apache-2.0 OR MIT
 compatibility: Requires Python 3 (tested on 3.12) and outbound network access to public package registries. git is optional (used by diff_lock.py --git).
 metadata:
   author: Enzo (MilesONerd)
-  version: "1.0.0"
+  version: "1.1.0"
   repository: https://github.com/MilesONerd/verify-dependency
 ---
 
@@ -50,8 +50,10 @@ The `import` name often differs from the install name (`import bs4` → `beautif
 ### 3. Run the verifier
 
 ```bash
-python3 scripts/check_dep.py <ecosystem> <name>
+python3 <skill-dir>/scripts/check_dep.py <ecosystem> <name>
 ```
+
+`<skill-dir>` is the directory that contains this `SKILL.md`. Every `scripts/...` path in this skill is relative to it, so resolve it first (or `cd` there). Running `python3 scripts/check_dep.py` from the project root fails because the scripts are not in the project.
 
 Ecosystems: `npm`, `pypi`, `crates`, `gem`, `nuget`, `go`, `packagist`, `aur`, `hex`, `pub`, `maven` (format `group:artifact`). Aliases such as `pip`, `cargo`, `composer`, `dotnet` work. One candidate per run. Uses only the Python standard library (tested on 3.12). `GITHUB_TOKEN` in the environment raises the GitHub API rate limit (anonymous: 60/hour, easy to exhaust). `--no-repo` skips the repository check (useful in bulk).
 
@@ -62,6 +64,7 @@ The script queries the registry, then the declared repository (existence, fork, 
 - **`not_found`**: the name does not exist. Say so plainly ("this package does not exist, it was probably a hallucination"). Do not try name variations blindly and **never** suggest registering the name. Look for real alternatives (web search, official documentation, `registry_search_hits`) and run **each** candidate through the same process, since search results are not verified.
 - **`error`**: a network failure does **not** mean "does not exist" and does **not** mean "ok". Try another route (open the registry page and the repository page). If that also fails, report that verification was not possible and do not proceed as if it had been verified.
 - **`found`**: the registry confirms existence, which is only the beginning. Continue to step 5.
+- **`repository.manifest_check`**: `match` or `mismatch` is a real comparison; `inconclusive` (manifest unreadable, monorepo, `setup.py` project) and `not_supported` (every ecosystem except npm, crates.io and PyPI) mean the package name was **not** compared with the repository. Report that as "not checked", never as "matches".
 - **Repository `limited`**: the GitHub API was unavailable. The script only confirmed that the repository exists (and, when possible, the name in its manifest); stars, activity, fork and archived status were **not** verified. Open the repository to complete the check, or declare the gap in the report.
 
 ### 5. Manual verification (what the script does not do)
@@ -91,10 +94,12 @@ Note on PyPI: `--only-binary=:all:` prevents resolving source distributions (sdi
 **b) Compare and verify what came in:**
 
 ```bash
-python3 scripts/diff_lock.py --git <lockfile> --verify        # against HEAD
-python3 scripts/diff_lock.py old.lock new.lock --verify       # two files
-python3 scripts/diff_lock.py old.txt new.json --verify        # pip freeze vs pip report
+python3 <skill-dir>/scripts/diff_lock.py --git <lockfile> --verify        # against HEAD (lockfile path relative to where you run it)
+python3 <skill-dir>/scripts/diff_lock.py old.lock new.lock --verify       # two files
+python3 <skill-dir>/scripts/diff_lock.py old.txt new.json --verify        # pip freeze vs pip report
 ```
+
+In `--git` mode the lockfile may live in any subdirectory; use `--base <ref>` to compare against something other than `HEAD`. An unknown ref, a directory outside a git repository, or an unreadable file is reported as an error, never as "everything added". A `parse_warning` in the output means a non-empty lockfile produced zero packages (possibly an unsupported format version): say so instead of reporting "nothing changed".
 
 Reads `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (best effort), `Cargo.lock`, `poetry.lock`, `uv.lock`, `requirements*.txt`/`pip freeze`, `go.sum`, `composer.lock`, `Gemfile.lock` and pip reports. Lists **added**, **changed** and **removed** packages, annotates sources outside the registry and install scripts, and with `--verify` queries the registry for every added package (without the repository check, so it fits in bulk). If the parser does not recognize the lockfile, or the output is empty for no apparent reason, say so instead of assuming "nothing changed".
 
@@ -113,7 +118,7 @@ Write it in the user's language, concise, in this format:
 | Adoption | N downloads/votes (an indicator, not proof) |
 | License / maintainers | ... |
 | Repository | [link] · ⭐ N · last push YYYY-MM-DD · [archived/fork if applicable] |
-| Cross-check | does the repository manifest match the package name? install scripts? |
+| Cross-check | does the repository manifest match the package name (automated only for npm, crates.io and PyPI; otherwise write "not checked")? install scripts? |
 | Transitive | N new (summary; details of the flagged ones) |
 | Not verified | what was left out and why |
 
@@ -144,13 +149,13 @@ Stars, downloads, activity, age and maintainer reputation are **indicators**. Le
 | `REPO_NOT_FOUND` | high | The registry points to a repository that does not exist. Very suspicious. |
 | `NEW_PACKAGE`, `NO_REPO`, `LOW_ADOPTION` | medium | Classic profile of a package registered to catch hallucinations when they appear together. Do not use without strong confirmation. |
 | `STDLIB_NAME_COLLISION` | medium | The name is that of a built-in language module (`path`, `fs`, `os`). You probably need to install nothing, and the third-party package with the same name is not the built-in module. Use the stdlib. |
-| `SIMILAR_TO_POPULAR` | medium | Possible typosquatting. Confirm the name is exactly the official project's. |
+| `SIMILAR_TO_POPULAR` | medium | Possible typosquatting. Confirm the name is exactly the official project's. The check uses a small built-in list of popular names, so the absence of this flag does **not** mean the name is not a typosquat. |
 | `INSTALL_SCRIPTS` | medium | Runs code at install time (npm). Read the script first. |
 | `REPO_MANIFEST_MISMATCH` | medium | The declared repository carries a different name in its manifest. Could be a monorepo, could be a front. |
 | `REPO_IS_FORK` | medium | Confirm it is the original project and not a tampered copy. |
 | `ORPHAN` (AUR) | medium | No maintainer; anyone can adopt it. Read the PKGBUILD with extra care. |
 | `STALE`, `FEW_VERSIONS`, `REPO_INACTIVE`, `REPO_ARCHIVED`, `DEPRECATED` | maintenance | Maintenance risk, not necessarily malware (old, stable packages are common). Report it and, where relevant, suggest a maintained alternative. Abandoned projects can also be hijacked: read it together with the other signals. |
-| `REPO_UNVERIFIED`, `ADOPTION_UNAVAILABLE`, `FEW_STARS` | info | Limits of the check or weak data. State them in the report. |
+| `REPO_UNVERIFIED`, `MANIFEST_NOT_CHECKED`, `ADOPTION_UNAVAILABLE`, `FEW_STARS` | info | Limits of the check or weak data. State them in the report. |
 
 ## Required operations (tool-independent)
 
