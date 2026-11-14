@@ -1,0 +1,2 @@
+# Aider does not discover instruction files by name: load AGENTS.md as read-only context.
+read: AGENTS.md
