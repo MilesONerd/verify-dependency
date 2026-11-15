@@ -12,13 +12,16 @@ Usage:
       does not exist at REF, everything is treated as "added".
 
   --verify   runs the registry check (check_dep.py, without the repository check)
-             on every ADDED dependency and highlights the ones with alerts.
+             on every ADDED dependency and highlights the ones with alerts. It also checks the release
+             timing of the new versions of CHANGED dependencies (a dormant package that suddenly
+             publishes is a classic account-takeover pattern).
   --max N    limit on the number of dependencies checked (default 150).
 
 Supported lockfiles (detected by file name):
   package-lock.json, npm-shrinkwrap.json, yarn.lock (v1 and berry), pnpm-lock.yaml (best effort),
   Cargo.lock, poetry.lock, uv.lock, requirements*.txt / pip freeze (only lines with ==),
   go.sum, composer.lock, Gemfile.lock
+  go-list*.txt = output of `go list -m all` (go.sum can omit transitive modules; the module graph does not)
   *.json = pip report (`pip install --dry-run --report FILE ...`); compare it with `pip freeze > old.txt`
 
 Python standard library only. Output: JSON on stdout.
@@ -93,6 +96,7 @@ def p_yarn(text):
         m = re.search(r'^\s+version:? "?([^"\s]+)"?', block, re.M)
         if m and name and not m.group(1).startswith("0.0.0-use.local"):
             L.add(name, m.group(1))
+    L.structured = "# yarn lockfile" in text or "__metadata:" in text
     return L
 
 
@@ -116,6 +120,7 @@ def p_pnpm(text):
             mm = re.match(r"^  '?/?(@[^@\s'/]+/[^@\s'/]+|[^@\s'/]+)@(\d[^:\s'()]*)", line)
         if mm:
             L.add(mm.group(1), mm.group(2))
+    L.structured = bool(re.search(r"^lockfileVersion:", text, re.M))
     return L
 
 
@@ -131,6 +136,8 @@ def _toml_blocks(text, eco, keep):
         if src and "git" in src.group(1) and eco == "crates":
             note = f"git source: {src.group(1).strip()}"
         L.add(norm_py(n.group(1)) if eco == "pypi" else n.group(1), v.group(1), note)
+    # A recognized format with no third-party packages (a brand-new project) is a real result, not a parse failure.
+    L.structured = bool(text.split("[[package]]")[1:]) or "[metadata]" in text or bool(re.search(r"^version\s*=\s*\d+\s*$", text, re.M))
     return L
 
 
@@ -178,6 +185,7 @@ def p_gemfile(text):
         m = re.match(r"^    ([A-Za-z0-9_.\-]+) \(([^)]+)\)$", line)
         if m:
             L.add(m.group(1), m.group(2))
+    L.structured = bool(re.search(r"^(GEM|PLATFORMS|DEPENDENCIES)\s*$", text, re.M))
     return L
 
 
@@ -205,6 +213,8 @@ def parser_for(path):
         return p_cargo
     if b in ("poetry.lock", "uv.lock"):
         return p_pylock
+    if b.startswith("go-list"):  # output of `go list -m all` (the module graph, including transitive modules)
+        return p_gosum
     if b.endswith(".txt"):  # requirements*.txt or `pip freeze` output
         return p_requirements
     if b == "go.sum":
@@ -287,14 +297,49 @@ def parse_old(text, parse, alt_parse, eco):
     return first or Lock(eco)
 
 
-def verify(eco, added, limit):
+CHANGED_KEEP = ("RECENT_RELEASE_ON_MATURE_PKG", "NEW_PUBLISHER", "SECURITY_HOLDING")
+
+
+def verify_changed(eco, changed, state):
+    """Checks the release timing of the NEW versions of packages that were already in the lockfile.
+    A dormant package that suddenly publishes is the classic account-takeover pattern and would otherwise
+    look like an ordinary version bump."""
+    import check_dep
+    for c in changed:
+        new_versions = [v for v in c["to"] if v not in c["from"]]
+        if state["checked"] >= state["limit"]:
+            c["verification"] = {"status": "skipped", "reason": f"--max limit of {state['limit']} reached"}
+            continue
+        flags, published, errors, dated = [], {}, [], True
+        for v in new_versions:
+            state["checked"] += 1
+            res, _ = check_dep.check(eco, c["name"], repo=False, version=v)
+            if res["status"] != "found":
+                errors.append(res.get("error") or res["status"])
+                continue
+            published[v] = res["registry"].get("target_published")
+            codes = {f["code"] for f in res["flags"]}
+            flags += [f for f in CHANGED_KEEP if f in codes and f not in flags]
+            dated = dated and "RELEASE_HISTORY_UNAVAILABLE" not in codes
+            time.sleep(0.05)
+        c["verification"] = {"status": "error" if errors and not published else "found", "new_versions": new_versions,
+                             "published": published, "flags": flags, "release_dates_checked": dated}
+        if errors:
+            c["verification"]["error"] = "; ".join(errors)[:200]
+
+
+def verify(eco, added, limit, state=None):
     import check_dep
     checked = 0
     for a in added:
+        if state is not None:
+            checked = state["checked"]
         if checked >= limit:
             a["verification"] = {"status": "skipped", "reason": f"--max limit of {limit} reached"}
             continue
         checked += 1
+        if state is not None:
+            state["checked"] = checked
         res, _ = check_dep.check(eco, a["name"], repo=False)
         v = {"status": res["status"], "signals": res.get("signals")}
         if res["status"] == "found":
@@ -377,13 +422,22 @@ def main():
     if os.path.basename(new_path).lower() == "pnpm-lock.yaml":
         res["parse_quality"] = "best_effort"
     if do_verify:
-        verify(new.eco, added, limit)
+        state = {"checked": 0, "limit": limit}
+        verify(new.eco, added, limit, state)
+        verify_changed(new.eco, changed, state)
         res["needs_attention"] = [a["name"] for a in added
                                   if (a.get("verification") or {}).get("signals") in ("attention", "strong_alerts")]
         res["not_found"] = [a["name"] for a in added if (a.get("verification") or {}).get("status") == "not_found"]
         res["verification_errors"] = [a["name"] for a in added if (a.get("verification") or {}).get("status") == "error"]
+        res["changed_needs_attention"] = [c["name"] for c in changed if (c.get("verification") or {}).get("flags")]
+        res["changed_not_date_checked"] = [c["name"] for c in changed
+                                           if (c.get("verification") or {}).get("status") == "found"
+                                           and not (c.get("verification") or {}).get("release_dates_checked")]
+        res["changed_verification_errors"] = [c["name"] for c in changed if (c.get("verification") or {}).get("status") == "error"]
         res["verification_note"] = ("Registry-only check (no repository check). Signals are indicators, not proof of security. "
-                                    "Manually review the ones that need attention and the ones that carry 'notes'.")
+                                    "Manually review the ones that need attention and the ones that carry 'notes'. "
+                                    "New versions of existing packages are checked for dormant-package revival only; "
+                                    "packages in changed_not_date_checked have no per-version dates in their registry API.")
     res.update(added=added, changed=changed, removed=removed)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)

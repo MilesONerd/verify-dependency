@@ -17,7 +17,8 @@ def iso(days_ago):
 
 def info(**kw):
     base = dict(version="1.0.0", created=iso(2000), modified=iso(10), n_versions=40, repo="https://github.com/a/b",
-                deprecated=None, install_scripts=None, adoption=("weekly downloads (npm)", 10 ** 6, 1000), maintainers=["m"], notes=[])
+                deprecated=None, install_scripts=None, adoption=("weekly downloads (npm)", 10 ** 6, 1000), maintainers=["m"], notes=[],
+                release_times={"0.9.0": iso(200), "1.0.0": iso(10)})
     base.update(kw)
     return base
 

@@ -30,13 +30,13 @@ Nothing is installed, and nothing is written to your real manifest or lockfile, 
 
 Supported ecosystems: npm, PyPI, crates.io, RubyGems, NuGet, Go, Packagist, Maven, Hex, pub.dev, AUR.
 Lockfiles read by `diff_lock.py`: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (best effort), `Cargo.lock`,
-`poetry.lock`, `uv.lock`, `requirements*.txt` / `pip freeze`, `go.sum`, `composer.lock`, `Gemfile.lock`, and pip
+`poetry.lock`, `uv.lock`, `requirements*.txt` / `pip freeze`, `go.sum`, `go list -m all` output, `composer.lock`, `Gemfile.lock`, and pip
 reports (`pip install --dry-run --report`).
 
 ### What it detects
 
 Non-existent names, packages replaced by registry security placeholders, repositories that do not exist, names
-that collide with built-in modules (`npm install path`), names close to popular packages, new packages with little
+that collide with built-in modules (`npm install path`), names close to popular packages or differing only by separators and look-alike characters (`body_parser`), non-ASCII names, dormant packages that suddenly publish and publishers never seen before (the account-takeover patterns, also checked on the new versions of packages already in your lockfile), new packages with little
 adoption, install scripts, forks, manifest/repository name mismatches (automated for npm, crates.io and PyPI only; the report says "not checked" for the rest), orphaned AUR packages, and, as
 informational flags, stale, archived or deprecated projects.
 
@@ -63,6 +63,22 @@ reads skills from (`.agents/skills/` is the cross-client convention described by
 git clone https://github.com/MilesONerd/verify-dependency.git
 ```
 
+## Auditing this skill before you install it
+
+A skill is part of your supply chain: `SKILL.md` is a prompt that stays in your agent's context, and the scripts run on your
+machine. Treat this one like any other dependency, which is the whole point of it.
+
+- **Read it.** `SKILL.md` is about 185 lines and the two scripts use only the Python standard library.
+- **Pin it.** Install from a tagged release or a commit hash, not from a moving branch. `python3 tools/package.py` prints the SHA-256 of
+  `verify-dependency.skill` and writes it next to the file; compare it with the one published with the release.
+- **Let the tests check the surface.** `tests/test_audit_surface.py` fails if the scripts start to contact a host outside an audited list,
+  import anything unexpected, use `eval`/`exec`/`os.system`, delete or write files, run anything other than `git`, or fetch a URL chosen
+  by a package (repository links from package metadata are fetched from `github.com` only). It also fails if `SKILL.md` gains phrases that
+  tell an agent to hide output or skip the approval. The hosts contacted are the package registries (npm, PyPI, crates.io, RubyGems,
+  NuGet, Go proxy, Packagist, Hex, pub.dev, Maven Central, AUR) plus `api.github.com`, `raw.githubusercontent.com` and `github.com`.
+- **Review every change or fork.** Look for instructions that weaken the approval rule or the report, new hosts, new imports, obfuscated or
+  encoded strings, and anything that executes what it downloads. The tests catch some of this; they do not replace reading the diff.
+
 ## Use the scripts directly
 
 ```bash
@@ -84,6 +100,24 @@ rate limit (60 requests per hour when anonymous).
 |---|---|
 | npm, PyPI, crates.io | Tested against the live registries. |
 | RubyGems, NuGet, Go, Packagist, Maven, Hex, pub.dev, AUR | Parsers tested against mocked responses only. Run the live test in your own environment before relying on them. |
+
+## Limitations and design choices
+
+- **Approval is always required, and there is no allowlist.** Approval fatigue is real, and a compact report for well-known packages is the
+  mitigation. Dependencies already in your lockfile are outside the workflow, and updates are summarized as one diff rather than asked
+  about one by one. A bypass list is a prime prompt-injection target (the agent could be talked into adding to it), so none is shipped.
+  If you want one, it should be a file you own, keyed by exact ecosystem, name and version, that the agent cannot write to.
+- **The list of popular packages is small and static.** `LOOKALIKE_OF_POPULAR` and `SIMILAR_TO_POPULAR` only compare against it, so a typosquat
+  of a niche package passes. A dynamic top-N from the registries was not adopted: there is no uniform official source (crates.io has one, npm does
+  not), it adds network dependence, it makes results vary over time in a verifier meant to be deterministic, and the list itself becomes a trust
+  anchor. A better path is a committed snapshot, refreshed by a maintainer script and reviewed as a diff.
+- **Account compromise is only partly covered.** The dormant-package and new-publisher checks catch two patterns. A hijacked maintainer account
+  publishing a new version of an actively maintained package looks normal to every signal here. Pin versions, prefer packages with build
+  provenance, and delay adopting brand-new versions when you can.
+- **Repository cross-checks cover GitHub only.** Repositories on GitLab, Codeberg, SourceHut and self-hosted forges get an informational
+  `REPO_UNVERIFIED`. Fetching them would need per-forge APIs and a strict host allowlist, because the URL comes from the package's own metadata.
+- **GitHub rate limits.** `diff_lock.py --verify` makes no GitHub requests (measured: 0 for a 65-package tree); it queries registries only.
+  A single `check_dep.py` run makes one to three.
 
 ## Using AI agents on this repository
 
@@ -112,6 +146,9 @@ Notes:
   the content twice.
 - Checked against vendor documentation in November 2026. This is documentation-based; each tool was not run to
   confirm. This area changes quickly, so re-check before relying on a detail.
+
+The lockfile preview commands in `SKILL.md` were run for real for npm, pip, Cargo (1.75), Go (1.22, with `GOPROXY=direct`), pnpm 12, uv 0.11 and
+Poetry 2.5, and `diff_lock.py` was run on the lockfiles they produced. They are not tested for yarn (classic or berry), composer and bundler.
 
 ## Development
 

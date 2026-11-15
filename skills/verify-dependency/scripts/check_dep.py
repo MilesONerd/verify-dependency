@@ -4,7 +4,7 @@
 """
 Checks a dependency against public registries and cross-checks it with its repository.
 
-Usage:   python3 check_dep.py <ecosystem> <name> [--no-repo]
+Usage:   python3 check_dep.py <ecosystem> <name> [--no-repo] [--version X]
 Examples:
   python3 check_dep.py npm express
   python3 check_dep.py pypi requests
@@ -12,7 +12,8 @@ Examples:
   python3 check_dep.py maven org.apache.commons:commons-lang3
 
 Ecosystems: npm, pypi, crates, gem, nuget, go, packagist, aur, hex, pub, maven
-Options: --no-repo  skip the repository check (useful when checking many dependencies at once).
+Options: --no-repo     skip the repository check (useful when checking many dependencies at once).
+         --version X   evaluate release timing for version X instead of the latest one.
 Output: JSON on stdout. Exit code: 0 = found, 1 = does not exist, 2 = network error / inconclusive.
 The "signals" field summarizes automatic signals (no_alerts / attention / strong_alerts).
 It is NOT a security certification.
@@ -95,6 +96,38 @@ def lev(a, b):
     return prev[-1]
 
 
+# Registries that treat case and the separators - _ . as the same name (so "Flask" and "flask" are one package).
+NORMALIZING = ("pypi", "crates")
+_CONFUSABLES = (("rn", "m"), ("vv", "w"), ("cl", "d"))
+
+
+def skeleton(n):
+    """Collapses separators and common look-alike characters so that 'body_parser', 'vvs' and 'rnoment' compare equal to 'body-parser', 'ws' and 'moment'."""
+    n = n.lower()
+    for a, b in _CONFUSABLES:
+        n = n.replace(a, b)
+    return re.sub(r"[-_.]", "", n.translate(str.maketrans("01", "ol")))
+
+
+def earliest(pairs):
+    """{version: earliest timestamp} from (version, timestamp) pairs, ignoring empty values."""
+    out = {}
+    for v, ts in pairs:
+        if v and ts and (v not in out or str(ts) < str(out[v])):
+            out[v] = ts
+    return out
+
+
+def release_dates(info, version):
+    """(published, previous_release) as datetimes for `version`, or (None, None) when the registry gave no dates."""
+    rt = info.get("release_times") or {}
+    cur = to_dt(rt.get(version))
+    if not cur:
+        return None, None
+    prev = max((d for d in (to_dt(t) for v, t in rt.items() if v != version) if d and d < cur), default=None)
+    return cur, prev
+
+
 HOSTS = r"github\.com|gitlab\.com|codeberg\.org|bitbucket\.org|sr\.ht|sourcehut"
 
 
@@ -108,7 +141,7 @@ def pick_repo(*urls):
 def mk(**kw):
     base = dict(version=None, created=None, modified=None, n_versions=None, repo=None, repo_dir=None,
                 homepage=None, license=None, description=None, maintainers=None, deprecated=None,
-                install_scripts=None, adoption=None, notes=[])
+                install_scripts=None, adoption=None, release_times=None, publishers=None, provenance=None, notes=[])
     base.update(kw)
     return base
 
@@ -134,7 +167,11 @@ def r_npm(name):
             adoption = ("weekly downloads (npm)", d2["downloads"], 1000)
     except NetErr:
         pass
-    return mk(version=latest, created=t.get("created"), modified=t.get("modified"),
+    vers = d.get("versions") or {}
+    return mk(release_times=earliest((v, t.get(v)) for v in vers),
+              publishers={v: (m.get("_npmUser") or {}).get("name") for v, m in vers.items()},
+              provenance={v: "attestations" in (m.get("dist") or {}) for v, m in vers.items()},
+              version=latest, created=t.get("created"), modified=t.get("modified"),
               n_versions=len(d.get("versions") or {}), repo=repo_url, repo_dir=repo_dir,
               homepage=d.get("homepage"), license=v.get("license") or d.get("license"),
               description=d.get("description"),
@@ -159,7 +196,8 @@ def r_pypi(name):
     except (NetErr, KeyError):
         pass
     lic = info.get("license") or ""
-    return mk(version=info.get("version"), created=min(times) if times else None,
+    return mk(release_times=earliest((v, min((f["upload_time"] for f in fl if f.get("upload_time")), default=None)) for v, fl in rel.items()),
+              version=info.get("version"), created=min(times) if times else None,
               modified=max(times) if times else None, n_versions=len(rel),
               repo=pick_repo(*urls.values(), info.get("home_page")),
               homepage=info.get("home_page") or urls.get("Homepage"),
@@ -175,7 +213,9 @@ def r_crates(name):
     if s == 404:
         return None
     c, vs = d["crate"], d.get("versions") or []
-    return mk(version=c.get("max_stable_version") or c.get("max_version"), created=c.get("created_at"),
+    return mk(release_times=earliest((v.get("num"), v.get("created_at")) for v in vs),
+              publishers={v.get("num"): (v.get("published_by") or {}).get("login") for v in vs},
+              version=c.get("max_stable_version") or c.get("max_version"), created=c.get("created_at"),
               modified=c.get("updated_at"), n_versions=len(vs), repo=c.get("repository"),
               homepage=c.get("homepage"), license=vs[0].get("license") if vs else None,
               description=c.get("description"),
@@ -191,7 +231,8 @@ def r_gem(name):
     s2, vs = get(f"https://rubygems.org/api/v1/versions/{q(name)}.json")
     vs = vs or []
     times = [v["created_at"] for v in vs if v.get("created_at")]
-    return mk(version=d.get("version"), created=min(times) if times else None,
+    return mk(release_times=earliest((v.get("number"), v.get("created_at")) for v in vs),
+              version=d.get("version"), created=min(times) if times else None,
               modified=max(times) if times else None, n_versions=len(vs),
               repo=pick_repo(d.get("source_code_uri"), d.get("homepage_uri")),
               homepage=d.get("homepage_uri"), license=",".join(d.get("licenses") or []) or None,
@@ -236,7 +277,9 @@ def r_packagist(name):
     p = d["package"]
     vs = p.get("versions") or {}
     k = next((x for x in vs if not x.startswith("dev-") and not x.endswith("-dev")), None)
-    return mk(version=k, created=p.get("time"), n_versions=len(vs), repo=p.get("repository"),
+    return mk(release_times=earliest((ver, (meta or {}).get("time")) for ver, meta in vs.items()
+                                     if not ver.startswith("dev-") and not ver.endswith("-dev")),
+              version=k, created=p.get("time"), n_versions=len(vs), repo=p.get("repository"),
               license=",".join(vs.get(k, {}).get("license") or []) or None, description=p.get("description"),
               maintainers=[m.get("name") for m in p.get("maintainers", [])],
               deprecated=f"abandoned: {p['abandoned']}" if p.get("abandoned") else None,
@@ -266,7 +309,8 @@ def r_hex(name):
     if s == 404:
         return None
     meta = d.get("meta") or {}
-    return mk(version=d.get("latest_stable_version") or d.get("latest_version"), created=d.get("inserted_at"),
+    return mk(release_times=earliest((r.get("version"), r.get("inserted_at")) for r in (d.get("releases") or [])),
+              version=d.get("latest_stable_version") or d.get("latest_version"), created=d.get("inserted_at"),
               modified=d.get("updated_at"), n_versions=len(d.get("releases") or []),
               repo=pick_repo(*(meta.get("links") or {}).values()), license=",".join(meta.get("licenses") or []) or None,
               description=meta.get("description"),
@@ -282,7 +326,8 @@ def r_pub(name):
     lat, vs = d["latest"], d.get("versions") or []
     ps = lat.get("pubspec") or {}
     pubs = [v["published"] for v in vs if v.get("published")]
-    return mk(version=lat.get("version"), created=min(pubs) if pubs else None, modified=lat.get("published"),
+    return mk(release_times=earliest((v.get("version"), v.get("published")) for v in vs),
+              version=lat.get("version"), created=min(pubs) if pubs else None, modified=lat.get("published"),
               n_versions=len(vs), repo=pick_repo(ps.get("repository"), ps.get("homepage")),
               homepage=ps.get("homepage"), description=ps.get("description"),
               deprecated="discontinued" if d.get("isDiscontinued") else None,
@@ -431,7 +476,7 @@ def gh_check(info, eco, pkg):
 
 
 # ---------- evaluation ----------
-def evaluate(eco, name, info, gh):
+def evaluate(eco, name, info, gh, target_version=None):
     flags = []
 
     def add(level, code, msg):
@@ -486,10 +531,41 @@ def evaluate(eco, name, info, gh):
     if name.lower() in stdlib_names(eco) or norm(name) in stdlib_names(eco):
         add("medium", "STDLIB_NAME_COLLISION",
             f"the name matches a built-in {'Node' if eco == 'npm' else 'Python'} module: you probably need to install nothing, and the third-party package with this name is NOT the built-in module")
+    tv = target_version or info.get("version")
+    if info.get("release_times") is None:
+        add("info", "RELEASE_HISTORY_UNAVAILABLE", "this registry API does not expose per-version publication dates: the dormant-package-revival check was NOT performed")
+    else:
+        cur, prev = release_dates(info, tv)
+        if not cur:
+            add("info", "RELEASE_HISTORY_UNAVAILABLE", f"the publication date of version {tv} was not found: the dormant-package-revival check was NOT performed")
+        else:
+            pubs, prov = info.get("publishers") or {}, info.get("provenance") or {}
+            who = pubs.get(tv)
+            earlier = {pubs[v] for v, t in (info.get("release_times") or {}).items()
+                       if v != tv and pubs.get(v) and to_dt(t) and to_dt(t) < cur}
+            has_prov = bool(prov.get(tv))
+            if prev and age_days(cur) <= 30 and (cur - prev).days > 730:
+                ctx = ""
+                if who:
+                    ctx = (f" It was published by '{who}'" + (" (who also published earlier releases)" if who in earlier else " (who published none of the earlier releases)")
+                           + (" with build provenance." if has_prov else " without build provenance."))
+                add("medium", "RECENT_RELEASE_ON_MATURE_PKG",
+                    f"version {tv} was published {age_days(cur)} days ago, after {(cur - prev).days} days without a release: a dormant package suddenly publishing is a classic account-takeover pattern, but it can also be a returning maintainer.{ctx}")
+            if who and earlier and who not in earlier and not has_prov and age_days(cur) <= 90:
+                add("medium", "NEW_PUBLISHER",
+                    f"version {tv} was published by '{who}', who published none of the earlier releases (earlier publishers: {', '.join(sorted(earlier))}), and it carries no build provenance: a maintainer handover or a stolen token looks like this")
+    if not name.isascii():
+        add("medium", "NON_ASCII_NAME", "the name contains non-ASCII characters (possible homoglyph attack)")
+    raw = name.lower().split("/")[-1]
     n = norm(name).split("/")[-1]
     for pop in POPULAR.get(eco, []):
         p = norm(pop)
-        if n != p and min(len(n), len(p)) >= 4 and lev(n, p) <= (1 if min(len(n), len(p)) <= 5 else 2):
+        if (norm(raw) == p) if eco in NORMALIZING else (raw == pop.lower()):
+            continue  # it IS the popular package
+        if skeleton(raw) == skeleton(pop):
+            add("medium", "LOOKALIKE_OF_POPULAR", f"the name differs from the popular package '{pop}' only by separators (- _ .) or look-alike characters (rn/m, vv/w, 0/o, 1/l)")
+            break
+        if min(len(n), len(p)) >= 4 and lev(n, p) <= (1 if min(len(n), len(p)) <= 5 else 2):
             add("medium", "SIMILAR_TO_POPULAR", f"name is very close to the popular package '{pop}' (typosquatting risk)")
             break
     return flags
@@ -508,7 +584,7 @@ def suggestions(eco, name):
     return []
 
 
-def check(eco, name, repo=True):
+def check(eco, name, repo=True, version=None):
     """Checks a dependency. Returns (result, exit_code). Prints nothing."""
     res = {"ecosystem": eco, "name": name}
     try:
@@ -524,10 +600,18 @@ def check(eco, name, repo=True):
                    note="Never suggest registering the name. Registry search results are NOT verified: run each one through the same process.")
         return res, 1
     gh = gh_check(info, eco, name) if repo else {"status": "skipped", "note": "repository check disabled (--no-repo)"}
-    flags = evaluate(eco, name, info, gh)
+    flags = evaluate(eco, name, info, gh, target_version=version)
     signals = ("strong_alerts" if any(f["level"] == "high" for f in flags)
                else "attention" if any(f["level"] == "medium" for f in flags) else "no_alerts")
     ad = info.pop("adoption", None)
+    tv = version or info.get("version")
+    cur, prev = release_dates(info, tv)
+    info["target_version"], info["target_published"] = tv, iso(cur)
+    info["previous_release"] = iso(prev)
+    info["target_publisher"] = (info.get("publishers") or {}).get(tv)
+    info["target_provenance"] = (info.get("provenance") or {}).get(tv)
+    for k in ("release_times", "publishers", "provenance"):
+        info.pop(k, None)
     info["created"], info["modified"] = iso(to_dt(info.get("created"))), iso(to_dt(info.get("modified")))
     info.pop("repo_dir", None)
     res.update(status="found", signals=signals, registry=info,
@@ -537,7 +621,16 @@ def check(eco, name, repo=True):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv = sys.argv[1:]
+    version = None
+    if "--version" in argv:
+        i = argv.index("--version")
+        version = argv[i + 1] if i + 1 < len(argv) else None
+        if not version:
+            print(json.dumps({"status": "error", "error": "--version needs a value"}))
+            sys.exit(2)
+        del argv[i:i + 2]
+    args = [a for a in argv if not a.startswith("--")]
     if len(args) != 2:
         print(__doc__)
         sys.exit(2)
@@ -546,7 +639,7 @@ def main():
         print(json.dumps({"status": "error", "error": f"unknown ecosystem: {args[0]}",
                           "supported": sorted(REGISTRIES)}, ensure_ascii=False))
         sys.exit(2)
-    res, code = check(eco, args[1], repo="--no-repo" not in sys.argv)
+    res, code = check(eco, args[1], repo="--no-repo" not in argv, version=version)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(code)
 

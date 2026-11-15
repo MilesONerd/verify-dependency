@@ -49,6 +49,9 @@ Run the offline tests and `tools/package.py` before every commit.
   Inside `SKILL.md`, script paths are written as `<skill-dir>/scripts/...`. `tests/test_docs.py` enforces both.
 - Do not remove existing checks. Adding a flag means adding a test and a row in the flag table in `SKILL.md`.
 - Flag levels: `high` and `medium` change `signals`; `maintenance` and `info` do not.
+- The audit surface is deliberate: a new host, import, subprocess or file write requires a conscious edit of the allowlists in
+  `tests/test_audit_surface.py`. Never loosen those tests just to make a change pass, and never fetch a URL taken from package metadata unless
+  its host is on a fixed allowlist.
 
 ## Invariants of the skill (do not weaken)
 

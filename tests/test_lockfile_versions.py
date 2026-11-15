@@ -48,5 +48,22 @@ class Yarn(unittest.TestCase):
         self.assertEqual(d.p_yarn(V1).pkgs, {"@babel/core": {"7.20.0"}, "lodash": {"4.17.21"}})
 
 
+GO_LIST = "example.com/demo\ngithub.com/hashicorp/errwrap v1.0.0\ngithub.com/hashicorp/go-multierror v1.1.1\nexample.com/x v1.0.0 => ../x\n"
+
+
+class GoList(unittest.TestCase):
+    def test_go_list_output_is_parsed_and_the_main_module_is_skipped(self):
+        self.assertEqual(d.p_gosum(GO_LIST).pkgs, {"github.com/hashicorp/errwrap": {"v1.0.0"},
+                                                   "github.com/hashicorp/go-multierror": {"v1.1.1"}, "example.com/x": {"v1.0.0"}})
+
+    def test_file_name_selects_the_go_parser_before_the_generic_txt_rule(self):
+        self.assertIs(d.parser_for("go-list-new.txt"), d.p_gosum)
+        self.assertIs(d.parser_for("requirements.txt"), d.p_requirements)
+
+    def test_diff_of_two_graphs(self):
+        added, _, _ = d.diff(d.p_gosum("example.com/demo\n"), d.p_gosum(GO_LIST))
+        self.assertEqual({a["name"] for a in added}, {"github.com/hashicorp/errwrap", "github.com/hashicorp/go-multierror", "example.com/x"})
+
+
 if __name__ == "__main__":
     unittest.main()

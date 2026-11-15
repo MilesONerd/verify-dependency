@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 # Copyright (c) 2026 Enzo (MilesONerd)
 """Validates skills/verify-dependency and builds dist/verify-dependency.skill (a zip with one top-level folder)."""
+import hashlib
 import re
 import sys
 import zipfile
@@ -49,8 +50,15 @@ def build():
     files = sorted(p for p in SKILL.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc")
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
         for p in files:
-            z.write(p, Path(SKILL.name) / p.relative_to(SKILL))
+            # Fixed timestamp and permissions: the same sources must always produce the same bytes (and the same SHA-256).
+            info = zipfile.ZipInfo((Path(SKILL.name) / p.relative_to(SKILL)).as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, p.read_bytes())
     print(f"built {OUT.relative_to(ROOT)} ({len(files)} files)")
+    digest = hashlib.sha256(OUT.read_bytes()).hexdigest()
+    OUT.with_name(OUT.name + ".sha256").write_text(f"{digest}  {OUT.name}\n", encoding="utf-8")
+    print(f"sha256 {digest}")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ license: Apache-2.0 OR MIT
 compatibility: Requires Python 3 (tested on 3.12) and outbound network access to public package registries. git is optional (used by diff_lock.py --git).
 metadata:
   author: Enzo (MilesONerd)
-  version: "1.1.0"
+  version: "1.2.0"
   repository: https://github.com/MilesONerd/verify-dependency
 ---
 
@@ -55,7 +55,7 @@ python3 <skill-dir>/scripts/check_dep.py <ecosystem> <name>
 
 `<skill-dir>` is the directory that contains this `SKILL.md`. Every `scripts/...` path in this skill is relative to it, so resolve it first (or `cd` there). Running `python3 scripts/check_dep.py` from the project root fails because the scripts are not in the project.
 
-Ecosystems: `npm`, `pypi`, `crates`, `gem`, `nuget`, `go`, `packagist`, `aur`, `hex`, `pub`, `maven` (format `group:artifact`). Aliases such as `pip`, `cargo`, `composer`, `dotnet` work. One candidate per run. Uses only the Python standard library (tested on 3.12). `GITHUB_TOKEN` in the environment raises the GitHub API rate limit (anonymous: 60/hour, easy to exhaust). `--no-repo` skips the repository check (useful in bulk).
+Ecosystems: `npm`, `pypi`, `crates`, `gem`, `nuget`, `go`, `packagist`, `aur`, `hex`, `pub`, `maven` (format `group:artifact`). Aliases such as `pip`, `cargo`, `composer`, `dotnet` work. One candidate per run. Uses only the Python standard library (tested on 3.12). `GITHUB_TOKEN` in the environment raises the GitHub API rate limit (anonymous: 60/hour, easy to exhaust). `--no-repo` skips the repository check (useful in bulk). `--version X` judges the release timing of version X instead of the latest one.
 
 The script queries the registry, then the declared repository (existence, fork, archived, activity, and whether the repository's manifest carries the same name as the package), and returns JSON with `status`, `signals`, registry and repository data, and `flags`. Exit code: `0` found, `1` does not exist, `2` error/inconclusive.
 
@@ -85,9 +85,12 @@ Adding or updating a package changes the whole lockfile. Asking for 1 dependency
 |---|---|---|
 | npm | `npm install <pkg> --package-lock-only --ignore-scripts` | tested |
 | PyPI | `pip freeze > old.txt` and `pip install --dry-run --ignore-installed --only-binary=:all: --report new.json <pkg>` | tested |
-| Cargo | `cargo add <crate>` and `cargo fetch` (resolves and downloads; does not compile or run build scripts) | not tested |
-| Go | `go get <module>@<version>` and compare `go.sum` | not tested |
-| pnpm, yarn, uv, poetry, composer, bundler | use the package manager's "lockfile only, no scripts" option (confirm in its documentation) | not tested |
+| Cargo | `cargo add <crate>` (resolves, edits `Cargo.toml` and updates `Cargo.lock`; does not compile or run build scripts, and no `cargo fetch` is needed; needs cargo 1.62 or later) | tested (cargo 1.75) |
+| Go | `go list -m all > go-list-old.txt`, then `go get <module>@<version>`, then `go list -m all > go-list-new.txt` (downloads modules, does not compile). Compare the two files, not `go.sum`: `go.sum` records only what the build needed and can omit transitive modules | tested (Go 1.22, `GOPROXY=direct`) |
+| pnpm | `pnpm add <pkg> --lockfile-only --ignore-scripts` (creates no `node_modules`) | tested (pnpm 12, lockfile v9) |
+| uv | `uv add <pkg> --no-sync` (edits `pyproject.toml` and `uv.lock`; creates no `.venv`) | tested (uv 0.11) |
+| Poetry | `poetry add <pkg> --lock` (updates `poetry.lock`; may create an empty virtualenv, installs no packages) | tested (Poetry 2.5) |
+| yarn (classic and berry), composer, bundler | use the package manager's "lockfile only, no scripts" option (confirm in its documentation). Yarn classic has no lockfile-only mode | not tested |
 
 Note on PyPI: `--only-binary=:all:` prevents resolving source distributions (sdists), whose resolution can execute build code. If resolution fails for lack of a wheel, treat that as a finding to report, not as an obstacle to work around.
 
@@ -97,13 +100,14 @@ Note on PyPI: `--only-binary=:all:` prevents resolving source distributions (sdi
 python3 <skill-dir>/scripts/diff_lock.py --git <lockfile> --verify        # against HEAD (lockfile path relative to where you run it)
 python3 <skill-dir>/scripts/diff_lock.py old.lock new.lock --verify       # two files
 python3 <skill-dir>/scripts/diff_lock.py old.txt new.json --verify        # pip freeze vs pip report
+python3 <skill-dir>/scripts/diff_lock.py go-list-old.txt go-list-new.txt  # go list -m all, before and after
 ```
 
 In `--git` mode the lockfile may live in any subdirectory; use `--base <ref>` to compare against something other than `HEAD`. An unknown ref, a directory outside a git repository, or an unreadable file is reported as an error, never as "everything added". A `parse_warning` in the output means a non-empty lockfile produced zero packages (possibly an unsupported format version): say so instead of reporting "nothing changed".
 
-Reads `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (best effort), `Cargo.lock`, `poetry.lock`, `uv.lock`, `requirements*.txt`/`pip freeze`, `go.sum`, `composer.lock`, `Gemfile.lock` and pip reports. Lists **added**, **changed** and **removed** packages, annotates sources outside the registry and install scripts, and with `--verify` queries the registry for every added package (without the repository check, so it fits in bulk). If the parser does not recognize the lockfile, or the output is empty for no apparent reason, say so instead of assuming "nothing changed".
+Reads `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (best effort), `Cargo.lock`, `poetry.lock`, `uv.lock`, `requirements*.txt`/`pip freeze`, `go.sum`, `go list -m all` output (file name starting with `go-list`), `composer.lock`, `Gemfile.lock` and pip reports. Lists **added**, **changed** and **removed** packages, annotates sources outside the registry and install scripts, and with `--verify` queries the registry for every added package (without the repository check, so it fits in bulk). If the parser does not recognize the lockfile, or the output is empty for no apparent reason, say so instead of assuming "nothing changed".
 
-**c) Report on the transitive set:** counts (added/changed/removed); the list of added packages (compact if there are many); individual detail **only** for those in `needs_attention`, `not_found`, carrying `notes` (source outside the registry, install scripts) or with a verification error. State explicitly that transitive packages were checked **in the registry only**, not in their repositories, and offer to go deeper on the flagged ones. **Changed** versions deserve a look too: very recently published versions of already-known packages are an attack vector (check the release date on the registry page).
+**c) Report on the transitive set:** counts (added/changed/removed); the list of added packages (compact if there are many); individual detail **only** for those in `needs_attention`, `not_found`, carrying `notes` (source outside the registry, install scripts) or with a verification error. State explicitly that transitive packages were checked **in the registry only**, not in their repositories, and offer to go deeper on the flagged ones. **Changed** versions are checked too: `--verify` looks at the publication date and publisher of every NEW version of a package that was already in the lockfile. `changed_needs_attention` lists the packages whose new version looks like a dormant package that suddenly published, or like a publisher never seen before; `changed_not_date_checked` lists the ones whose registry API gives no per-version dates (NuGet, Go, Maven, AUR), which were therefore **not** checked and must be reported as such. A flag here is a reason to look at who published and why, not proof of a compromise: real maintainers do revive old packages, and a move to trusted publishing (publisher `GitHub Actions` with build provenance) is normal.
 
 ### 7. Report to the user
 
@@ -138,7 +142,7 @@ Use the verified version, recommend pinning the version (lockfile; hash where th
 
 ## What the signals mean (and do not mean)
 
-Stars, downloads, activity, age and maintainer reputation are **indicators**. Legitimate packages can have few downloads and malicious ones can have many (compromised accounts, bought stars, hijacked old projects). **Never** present the result as a certification, "safe package" or "approved". What may be said is "I found no automatic alerts" and "I found these signals".
+Stars, downloads, activity, age and maintainer reputation are **indicators**. Legitimate packages can have few downloads and malicious ones can have many (compromised accounts, bought stars, hijacked old projects). A compromised maintainer account that publishes a new version of an **actively maintained** package is not detectable by these signals: the dormant-revival and new-publisher checks catch only two patterns of it. **Never** present the result as a certification, "safe package" or "approved". What may be said is "I found no automatic alerts" and "I found these signals".
 
 `signals` in the JSON: `no_alerts` (no automatic alerts), `attention` (there is a `medium` flag), `strong_alerts` (there is a `high` flag). Maintenance flags and verification-limit flags do not change `signals`, but they must appear in the report.
 
@@ -149,13 +153,17 @@ Stars, downloads, activity, age and maintainer reputation are **indicators**. Le
 | `REPO_NOT_FOUND` | high | The registry points to a repository that does not exist. Very suspicious. |
 | `NEW_PACKAGE`, `NO_REPO`, `LOW_ADOPTION` | medium | Classic profile of a package registered to catch hallucinations when they appear together. Do not use without strong confirmation. |
 | `STDLIB_NAME_COLLISION` | medium | The name is that of a built-in language module (`path`, `fs`, `os`). You probably need to install nothing, and the third-party package with the same name is not the built-in module. Use the stdlib. |
-| `SIMILAR_TO_POPULAR` | medium | Possible typosquatting. Confirm the name is exactly the official project's. The check uses a small built-in list of popular names, so the absence of this flag does **not** mean the name is not a typosquat. |
+| `LOOKALIKE_OF_POPULAR` | medium | Differs from a popular package only by separators (`-`, `_`, `.`) or look-alike characters (`rn`/`m`, `vv`/`w`, `0`/`o`, `1`/`l`). On npm `body_parser` and `body-parser` are different packages. Typosquatting until proven otherwise. |
+| `SIMILAR_TO_POPULAR` | medium | Possible typosquatting by edit distance. Confirm the name is exactly the official project's. The check uses a small built-in list of popular names, so the absence of this flag and of `LOOKALIKE_OF_POPULAR` does **not** mean the name is not a typosquat. |
+| `NON_ASCII_NAME` | medium | The name has non-ASCII characters (homoglyph attack). |
+| `RECENT_RELEASE_ON_MATURE_PKG` | medium | The version was published in the last 30 days after more than 2 years without any release. A classic account-takeover pattern, but also what a returning maintainer looks like. Read the publisher and provenance in the message, then the changelog. |
+| `NEW_PUBLISHER` | medium | The version was published (last 90 days) by someone who published none of the earlier releases, with no build provenance. A maintainer handover or a stolen token looks like this. Only available where the registry reports the publisher (npm, crates.io). |
 | `INSTALL_SCRIPTS` | medium | Runs code at install time (npm). Read the script first. |
 | `REPO_MANIFEST_MISMATCH` | medium | The declared repository carries a different name in its manifest. Could be a monorepo, could be a front. |
 | `REPO_IS_FORK` | medium | Confirm it is the original project and not a tampered copy. |
 | `ORPHAN` (AUR) | medium | No maintainer; anyone can adopt it. Read the PKGBUILD with extra care. |
 | `STALE`, `FEW_VERSIONS`, `REPO_INACTIVE`, `REPO_ARCHIVED`, `DEPRECATED` | maintenance | Maintenance risk, not necessarily malware (old, stable packages are common). Report it and, where relevant, suggest a maintained alternative. Abandoned projects can also be hijacked: read it together with the other signals. |
-| `REPO_UNVERIFIED`, `MANIFEST_NOT_CHECKED`, `ADOPTION_UNAVAILABLE`, `FEW_STARS` | info | Limits of the check or weak data. State them in the report. |
+| `REPO_UNVERIFIED`, `MANIFEST_NOT_CHECKED`, `RELEASE_HISTORY_UNAVAILABLE`, `ADOPTION_UNAVAILABLE`, `FEW_STARS` | info | Limits of the check or weak data. State them in the report. |
 
 ## Required operations (tool-independent)
 
