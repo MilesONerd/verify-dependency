@@ -21,7 +21,8 @@ Supported lockfiles (detected by file name):
   package-lock.json, npm-shrinkwrap.json, yarn.lock (v1 and berry), pnpm-lock.yaml (best effort),
   Cargo.lock, poetry.lock, uv.lock, requirements*.txt / pip freeze (only lines with ==),
   go.sum, composer.lock, Gemfile.lock
-  go-list*.txt = output of `go list -m all` (go.sum can omit transitive modules; the module graph does not)
+  go-list*.txt = output of `go list -m all` (go.sum can omit transitive modules and knows nothing about replace
+  directives; the module graph has both)
   *.json = pip report (`pip install --dry-run --report FILE ...`); compare it with `pip freeze > old.txt`
 
 Python standard library only. Output: JSON on stdout.
@@ -43,6 +44,7 @@ class Lock:
     def __init__(self, eco, structured=False):
         self.eco = eco
         self.structured = structured  # True when the format is JSON: a successful parse with zero packages is a real result
+        self.local = {}  # module path -> local directory it is replaced with (code that does not come from a registry)
         self.pkgs = {}   # name -> set(versions)
         self.notes = {}  # name -> [notes]
 
@@ -170,6 +172,28 @@ def p_gosum(text):
     return L
 
 
+def p_golist(text):
+    """Output of `go list -m all`. A replaced module prints as `path version => replacement`, and the code that is
+    really used is the REPLACEMENT: a remote one (`=> other/path v1.2.3`) is recorded under its own path and version,
+    and a local one (`=> ./dir`, `=> /abs/dir`) is not a registry package, so it is reported separately and never verified as one."""
+    L = Lock("go")
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue  # the main module has no version
+        if "=>" in parts:
+            i = parts.index("=>")
+            left, right = parts[:i], parts[i + 1:]
+            if len(right) >= 2 and not right[0].startswith((".", "/", "\\")) and ":" not in right[0][:3]:
+                was = " ".join(left)
+                L.add(right[0], right[1], f"replaces {was} (a replace directive: the replacement is what is built)")
+            elif right:
+                L.local[left[0]] = right[0]
+            continue
+        L.add(parts[0], parts[1])
+    return L
+
+
 def p_composer(text):
     L = Lock("packagist", structured=True)
     d = json.loads(text)
@@ -213,8 +237,8 @@ def parser_for(path):
         return p_cargo
     if b in ("poetry.lock", "uv.lock"):
         return p_pylock
-    if b.startswith("go-list"):  # output of `go list -m all` (the module graph, including transitive modules)
-        return p_gosum
+    if b.startswith("go-list"):  # output of `go list -m all` (the module graph, including transitive modules and replace directives)
+        return p_golist
     if b.endswith(".txt"):  # requirements*.txt or `pip freeze` output
         return p_requirements
     if b == "go.sum":
@@ -297,7 +321,7 @@ def parse_old(text, parse, alt_parse, eco):
     return first or Lock(eco)
 
 
-CHANGED_KEEP = ("RECENT_RELEASE_ON_MATURE_PKG", "NEW_PUBLISHER", "SECURITY_HOLDING")
+CHANGED_KEEP = ("RECENT_RELEASE_ON_MATURE_PKG", "NEW_PUBLISHER", "PROVENANCE_DIGEST_MISMATCH", "PROVENANCE_REPO_MISMATCH", "SECURITY_HOLDING")
 
 
 def verify_changed(eco, changed, state):
@@ -340,17 +364,23 @@ def verify(eco, added, limit, state=None):
         checked += 1
         if state is not None:
             state["checked"] = checked
-        res, _ = check_dep.check(eco, a["name"], repo=False)
-        v = {"status": res["status"], "signals": res.get("signals")}
-        if res["status"] == "found":
-            r = res["registry"]
-            v.update(version=r.get("version"), created=r.get("created"), maintainers=r.get("maintainers"),
-                     flags=[f["code"] for f in res["flags"] if f["level"] in ("high", "medium")],
-                     maintenance=[f["code"] for f in res["flags"] if f["level"] == "maintenance"])
-        elif res["status"] == "not_found":
+        # Judge the version(s) that are really in the lockfile, not the registry's latest one (at most 3, to bound the requests).
+        results = [check_dep.check(eco, a["name"], repo=False, version=ver)[0] for ver in a["versions"][:3]]
+        rank = {"no_alerts": 0, "attention": 1, "strong_alerts": 2}
+        first = next((r for r in results if r["status"] != "found"), results[0])
+        v = {"status": first["status"], "signals": max((r.get("signals") for r in results if r.get("signals")), key=lambda x: rank[x], default=None)}
+        if first["status"] == "found":
+            reg = results[0]["registry"]
+            flags, maintenance = [], []
+            for r in results:
+                flags += [f["code"] for f in r["flags"] if f["level"] in ("high", "medium") and f["code"] not in flags]
+                maintenance += [f["code"] for f in r["flags"] if f["level"] == "maintenance" and f["code"] not in maintenance]
+            v.update(version=a["versions"][0] if len(a["versions"]) == 1 else a["versions"][:3], latest_in_registry=reg.get("version"),
+                     created=reg.get("created"), maintainers=reg.get("maintainers"), flags=flags, maintenance=maintenance)
+        elif first["status"] == "not_found":
             v["flags"] = ["NOT_FOUND"]
         else:
-            v["error"] = res.get("error")
+            v["error"] = first.get("error")
         a["verification"] = v
         time.sleep(0.05)
 
@@ -438,6 +468,11 @@ def main():
                                     "Manually review the ones that need attention and the ones that carry 'notes'. "
                                     "New versions of existing packages are checked for dormant-package revival only; "
                                     "packages in changed_not_date_checked have no per-version dates in their registry API.")
+    local_added = sorted(f"{k} => {v}" for k, v in new.local.items() if old.local.get(k) != v)
+    local_removed = sorted(f"{k} => {v}" for k, v in old.local.items() if new.local.get(k) != v)
+    if local_added or local_removed:
+        res["local_replacements"] = {"added": local_added, "removed": local_removed,
+                                     "note": "These modules are replaced by a local directory: their code does not come from a registry and was NOT verified. Review that directory."}
     res.update(added=added, changed=changed, removed=removed)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     sys.exit(0)

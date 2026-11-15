@@ -23,10 +23,13 @@ def iso(days_ago):
     return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+CONSISTENT = {"attestation_present": True, "provenance_consistent": True, "provenance_verified": False}
+
+
 def info(rt, pubs=None, prov=None, version="2.0.0"):
     return dict(version=version, created=iso(4000), modified=iso(5), n_versions=len(rt or {}), repo="https://github.com/a/b",
                 deprecated=None, install_scripts=None, adoption=("downloads", 10 ** 6, 1000), maintainers=["m"], notes=[],
-                release_times=rt, publishers=pubs, provenance=prov)
+                release_times=rt, publishers=pubs, provenance_check=prov)
 
 
 def flags(i, **kw):
@@ -53,9 +56,10 @@ class DormantRevival(unittest.TestCase):
         rt = {"1.0.0": iso(3000), "2.0.0": iso(5)}
         known = flags(info(rt, {"1.0.0": "alice", "2.0.0": "alice"}))["RECENT_RELEASE_ON_MATURE_PKG"]["msg"]
         self.assertIn("who also published earlier releases", known)
-        stranger = flags(info(rt, {"1.0.0": "alice", "2.0.0": "mallory"}, {"2.0.0": True}))["RECENT_RELEASE_ON_MATURE_PKG"]["msg"]
+        stranger = flags(info(rt, {"1.0.0": "alice", "2.0.0": "mallory"}, CONSISTENT))["RECENT_RELEASE_ON_MATURE_PKG"]["msg"]
         self.assertIn("who published none of the earlier releases", stranger)
-        self.assertIn("with build provenance", stranger)
+        self.assertIn("with a build attestation consistent with the tarball", stranger)
+        self.assertIn("signature not verified by this tool", stranger)
 
     def test_history_unavailable_is_stated_not_silently_clean(self):
         self.assertEqual(flags(info(None))["RELEASE_HISTORY_UNAVAILABLE"]["level"], "info")
@@ -69,9 +73,18 @@ class NewPublisher(unittest.TestCase):
         fl = flags(info(self.RT, {"1.0.0": "alice", "1.1.0": "alice", "2.0.0": "mallory"}))
         self.assertEqual(fl["NEW_PUBLISHER"]["level"], "medium")
 
-    def test_provenance_clears_it_trusted_publishing_is_not_a_takeover(self):
-        fl = flags(info(self.RT, {"1.0.0": "alice", "1.1.0": "alice", "2.0.0": "GitHub Actions"}, {"2.0.0": True}))
+    def test_a_consistent_attestation_clears_it_trusted_publishing_is_not_a_takeover(self):
+        fl = flags(info(self.RT, {"1.0.0": "alice", "1.1.0": "alice", "2.0.0": "GitHub Actions"}, CONSISTENT))
         self.assertNotIn("NEW_PUBLISHER", fl)
+        self.assertEqual(fl["PROVENANCE_NOT_SIGNATURE_VERIFIED"]["level"], "info")
+
+    def test_a_present_but_unchecked_or_inconsistent_attestation_does_not_clear_it(self):
+        pubs = {"1.0.0": "alice", "1.1.0": "alice", "2.0.0": "mallory"}
+        for pc in ({"attestation_present": True, "provenance_consistent": None, "issue": "could not be fetched"},
+                   {"attestation_present": True, "provenance_consistent": False, "digest_matches": False, "issue": "digest"},
+                   {"attestation_present": False}):
+            with self.subTest(pc=pc):
+                self.assertIn("NEW_PUBLISHER", flags(info(self.RT, pubs, pc)))
 
     def test_known_publisher_is_not_flagged(self):
         self.assertNotIn("NEW_PUBLISHER", flags(info(self.RT, {"1.0.0": "alice", "1.1.0": "bob", "2.0.0": "bob"})))
@@ -97,10 +110,13 @@ class RegistryData(unittest.TestCase):
         doc = {"dist-tags": {"latest": "2.0.0"}, "time": {"created": "2015-01-01T00:00:00", "1.0.0": "2015-01-02T00:00:00", "2.0.0": "2026-01-01T00:00:00"},
                "versions": {"1.0.0": {"_npmUser": {"name": "alice"}, "dist": {}},
                             "2.0.0": {"_npmUser": {"name": "GitHub Actions"}, "dist": {"attestations": {"url": "x"}}}}, "maintainers": []}
+        doc["versions"]["2.0.0"]["dist"]["integrity"] = "sha512-AAAA"
+        doc["versions"]["2.0.0"]["dist"]["attestations"]["url"] = "https://registry.npmjs.org/-/npm/v1/attestations/pkg@2.0.0"
         got = self.run_case(lambda: c.r_npm("pkg"), {"registry.npmjs.org": doc})
         self.assertEqual(got["release_times"], {"1.0.0": "2015-01-02T00:00:00", "2.0.0": "2026-01-01T00:00:00"})
         self.assertEqual(got["publishers"], {"1.0.0": "alice", "2.0.0": "GitHub Actions"})
-        self.assertEqual(got["provenance"], {"1.0.0": False, "2.0.0": True})
+        self.assertEqual(got["attestation_urls"], {"1.0.0": None, "2.0.0": "https://registry.npmjs.org/-/npm/v1/attestations/pkg@2.0.0"})
+        self.assertEqual(got["integrity"]["2.0.0"], "sha512-AAAA")
 
     def test_pypi_uses_the_earliest_upload_per_release(self):
         doc = {"info": {"version": "2.0"}, "releases": {"1.0": [{"upload_time": "2020-01-02T00:00:00"}, {"upload_time": "2020-01-01T00:00:00"}],
@@ -150,10 +166,12 @@ class CheckIntegration(unittest.TestCase):
         with mock.patch.object(c, "get", return_value=(200, self.DOC)):
             res, code = c.check("npm", "pkg", repo=False)
         reg = res["registry"]
-        self.assertEqual((code, reg["target_version"], reg["target_publisher"], reg["target_provenance"]), (0, "2.0.0", "mallory", False))
+        self.assertEqual((code, reg["target_version"], reg["target_publisher"]), (0, "2.0.0", "mallory"))
+        self.assertFalse(reg["target_provenance"]["attestation_present"])
+        self.assertFalse(reg["target_provenance"]["provenance_verified"])
         self.assertEqual(res["signals"], "attention")
         self.assertTrue({"RECENT_RELEASE_ON_MATURE_PKG", "NEW_PUBLISHER"} <= {f["code"] for f in res["flags"]})
-        for k in ("release_times", "publishers", "provenance"):
+        for k in ("release_times", "publishers", "attestation_urls", "integrity", "provenance_check"):
             self.assertNotIn(k, reg)
 
     def test_version_option_targets_another_release(self):
@@ -231,6 +249,42 @@ class VerifyChanged(unittest.TestCase):
         res = json.loads(out.getvalue())
         self.assertEqual(res["changed_needs_attention"], ["dep"])
         self.assertEqual(res["changed_not_date_checked"], [])
+
+
+class VerifyAdded(unittest.TestCase):
+    """Added packages are judged by the version pinned in the lockfile, not by the registry's latest release."""
+
+    def test_the_locked_version_is_the_one_checked(self):
+        seen = []
+
+        def spy(eco, name, repo=True, version=None):
+            seen.append(version)
+            return {"status": "found", "signals": "no_alerts", "flags": [], "registry": {"version": "9.9.9", "created": None, "maintainers": []}}, 0
+        added = [{"name": "dep", "versions": ["1.2.3"], "notes": []}]
+        with mock.patch("check_dep.check", side_effect=spy):
+            d.verify("npm", added, 10)
+        self.assertEqual(seen, ["1.2.3"])
+        self.assertEqual(added[0]["verification"]["version"], "1.2.3")
+        self.assertEqual(added[0]["verification"]["latest_in_registry"], "9.9.9")
+
+    def test_several_locked_versions_are_all_checked_and_merged(self):
+        def fake(eco, name, repo=True, version=None):
+            flags = [{"code": "RECENT_RELEASE_ON_MATURE_PKG", "level": "medium"}] if version == "2.0.0" else []
+            return {"status": "found", "signals": "attention" if flags else "no_alerts", "flags": flags,
+                    "registry": {"version": "2.0.0", "created": None, "maintainers": []}}, 0
+        added = [{"name": "dep", "versions": ["1.0.0", "2.0.0"], "notes": []}]
+        with mock.patch("check_dep.check", side_effect=fake):
+            d.verify("npm", added, 10)
+        self.assertEqual(added[0]["verification"]["flags"], ["RECENT_RELEASE_ON_MATURE_PKG"])
+        self.assertEqual(added[0]["verification"]["signals"], "attention")
+
+    def test_a_missing_package_among_the_versions_is_reported(self):
+        def fake(eco, name, repo=True, version=None):
+            return {"status": "not_found", "flags": []}, 1
+        added = [{"name": "ghost", "versions": ["1.0.0"], "notes": []}]
+        with mock.patch("check_dep.check", side_effect=fake):
+            d.verify("npm", added, 10)
+        self.assertEqual((added[0]["verification"]["status"], added[0]["verification"]["flags"]), ("not_found", ["NOT_FOUND"]))
 
 
 if __name__ == "__main__":

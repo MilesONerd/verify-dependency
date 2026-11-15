@@ -22,7 +22,7 @@ archived, deprecated: informational, they do NOT change "signals") and info (lim
 Optional: GITHUB_TOKEN in the environment raises the GitHub API rate limit.
 Python standard library only.
 """
-import sys, json, re, os, signal
+import sys, json, re, os, signal, base64
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 
@@ -38,13 +38,46 @@ class NetErr(Exception):
     pass
 
 
+# The only hosts this script ever fetches from. Anything else is refused BEFORE a request is made, and a redirect to
+# any other host (or to plain http) is refused too: package metadata is attacker-influenced, so a URL taken from it
+# must never decide where we connect.
+FETCH_HOSTS = frozenset({
+    "registry.npmjs.org", "api.npmjs.org", "pypi.org", "pypistats.org", "crates.io", "rubygems.org",
+    "azuresearch-usnc.nuget.org", "proxy.golang.org", "packagist.org", "aur.archlinux.org", "hex.pm", "pub.dev",
+    "search.maven.org", "api.github.com", "raw.githubusercontent.com", "github.com",
+})
+ALLOWED_SCHEMES = ("https",)
+ALLOWED_PORTS = (None, 443)
+
+
+def _allowed(url):
+    p = urllib.parse.urlparse(url)
+    try:
+        port = p.port
+    except ValueError:
+        return False
+    return p.scheme in ALLOWED_SCHEMES and (p.hostname or "").lower() in FETCH_HOSTS and port in ALLOWED_PORTS and not p.username
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _allowed(newurl):
+            raise urllib.error.URLError(f"redirect to a URL that is not allowed: {newurl[:80]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SafeRedirect())
+
+
 def get(url, as_json=True, headers=None):
     """Returns (status, body). 404/410 -> (404, None). Network failure or HTTP error other than 404 -> NetErr."""
     h = {"User-Agent": UA, "Accept": "application/json" if as_json else "*/*"}
     if headers:
         h.update(headers)
+    if not _allowed(url):
+        raise NetErr(f"refusing to fetch {url[:80]}: not an https URL on an allowed registry or forge host")
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=TIMEOUT) as r:
+        with _OPENER.open(urllib.request.Request(url, headers=h), timeout=TIMEOUT) as r:
             body = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         if e.code in (404, 410):
@@ -141,7 +174,7 @@ def pick_repo(*urls):
 def mk(**kw):
     base = dict(version=None, created=None, modified=None, n_versions=None, repo=None, repo_dir=None,
                 homepage=None, license=None, description=None, maintainers=None, deprecated=None,
-                install_scripts=None, adoption=None, release_times=None, publishers=None, provenance=None, notes=[])
+                install_scripts=None, adoption=None, release_times=None, publishers=None, attestation_urls=None, integrity=None, notes=[])
     base.update(kw)
     return base
 
@@ -170,7 +203,8 @@ def r_npm(name):
     vers = d.get("versions") or {}
     return mk(release_times=earliest((v, t.get(v)) for v in vers),
               publishers={v: (m.get("_npmUser") or {}).get("name") for v, m in vers.items()},
-              provenance={v: "attestations" in (m.get("dist") or {}) for v, m in vers.items()},
+              attestation_urls={v: ((m.get("dist") or {}).get("attestations") or {}).get("url") for v, m in vers.items()},
+              integrity={v: (m.get("dist") or {}).get("integrity") for v, m in vers.items()},
               version=latest, created=t.get("created"), modified=t.get("modified"),
               n_versions=len(d.get("versions") or {}), repo=repo_url, repo_dir=repo_dir,
               homepage=d.get("homepage"), license=v.get("license") or d.get("license"),
@@ -476,6 +510,76 @@ def gh_check(info, eco, pkg):
 
 
 # ---------- evaluation ----------
+ATTESTATION_PREFIX = "https://registry.npmjs.org/-/npm/v1/attestations/"
+
+
+def provenance_check(info, version):
+    """npm build attestations, in three separate levels that must never be confused:
+    attestation_present: the registry says an attestation exists for this version (a claim, not a proof);
+    provenance_consistent: what we CAN check without cryptography agrees (digest of the tarball, source repository);
+    provenance_verified: the signature chain (Sigstore: Fulcio certificate, Rekor log) was verified. This tool cannot do
+    that with the standard library, so it is always False. `npm audit signatures` does it, after installation."""
+    out = {"attestation_present": False, "provenance_consistent": None, "provenance_verified": False,
+           "digest_matches": None, "repository_matches": None, "workflow_repository": None, "workflow_ref": None, "issue": None}
+    url = (info.get("attestation_urls") or {}).get(version)
+    if not url:
+        return out
+    out["attestation_present"] = True
+    if not url.startswith(ATTESTATION_PREFIX):
+        out.update(provenance_consistent=False, issue="the registry metadata points to an unexpected attestation URL")
+        return out
+    try:
+        status, doc = get(url)
+    except NetErr as e:
+        out["issue"] = f"the attestation could not be fetched: {e}"[:200]
+        return out
+    if not doc:
+        out["issue"] = "the attestation document was not found"
+        return out
+    statement = None
+    try:
+        for a in doc.get("attestations") or []:
+            if "slsa.dev/provenance" in str(a.get("predicateType")):
+                statement = json.loads(base64.b64decode(a["bundle"]["dsseEnvelope"]["payload"]))
+                break
+        if statement is None:
+            out.update(provenance_consistent=False, issue="no SLSA provenance statement in the attestation bundle")
+            return out
+        integrity = (info.get("integrity") or {}).get(version) or ""
+        want = base64.b64decode(integrity.split("-", 1)[1]).hex() if integrity.startswith("sha512-") else None
+        subjects = statement.get("subject") or []
+        out["digest_matches"] = (want is not None and any((x.get("digest") or {}).get("sha512") == want
+                                                         and str(x.get("name", "")).endswith("@" + version) for x in subjects)) if want else None
+        wf = ((statement.get("predicate") or {}).get("buildDefinition") or {}).get("externalParameters", {}).get("workflow") or {}
+        out["workflow_repository"], out["workflow_ref"] = wf.get("repository"), wf.get("ref")
+        declared, built = parse_repo(info.get("repo") or ""), parse_repo(wf.get("repository") or "")
+        if declared and built:
+            out["repository_matches"] = (declared[0], declared[1].lower(), declared[2].lower()) == (built[0], built[1].lower(), built[2].lower())
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError) as e:
+        out.update(provenance_consistent=False, issue=f"the attestation is malformed: {type(e).__name__}")
+        return out
+    problems = []
+    if out["digest_matches"] is False:
+        problems.append("its digest does not match the published tarball")
+    if out["repository_matches"] is False:
+        problems.append("its source repository differs from the one the package declares")
+    if problems:
+        out.update(provenance_consistent=False, issue="; ".join(problems))
+    elif out["digest_matches"] is True:
+        out["provenance_consistent"] = True
+    else:
+        out["issue"] = "the tarball digest could not be compared"
+    return out
+
+
+def _prov_phrase(pc):
+    if not (pc or {}).get("attestation_present"):
+        return "no build attestation"
+    if pc.get("provenance_consistent") is True:
+        return "a build attestation consistent with the tarball and repository (signature not verified by this tool)"
+    return "a build attestation that could not be confirmed as consistent"
+
+
 def evaluate(eco, name, info, gh, target_version=None):
     flags = []
 
@@ -539,21 +643,31 @@ def evaluate(eco, name, info, gh, target_version=None):
         if not cur:
             add("info", "RELEASE_HISTORY_UNAVAILABLE", f"the publication date of version {tv} was not found: the dormant-package-revival check was NOT performed")
         else:
-            pubs, prov = info.get("publishers") or {}, info.get("provenance") or {}
+            pubs = info.get("publishers") or {}
             who = pubs.get(tv)
             earlier = {pubs[v] for v, t in (info.get("release_times") or {}).items()
                        if v != tv and pubs.get(v) and to_dt(t) and to_dt(t) < cur}
-            has_prov = bool(prov.get(tv))
+            pc = info.get("provenance_check") or {}
             if prev and age_days(cur) <= 30 and (cur - prev).days > 730:
                 ctx = ""
                 if who:
                     ctx = (f" It was published by '{who}'" + (" (who also published earlier releases)" if who in earlier else " (who published none of the earlier releases)")
-                           + (" with build provenance." if has_prov else " without build provenance."))
+                           + f" with {_prov_phrase(pc)}.")
                 add("medium", "RECENT_RELEASE_ON_MATURE_PKG",
                     f"version {tv} was published {age_days(cur)} days ago, after {(cur - prev).days} days without a release: a dormant package suddenly publishing is a classic account-takeover pattern, but it can also be a returning maintainer.{ctx}")
-            if who and earlier and who not in earlier and not has_prov and age_days(cur) <= 90:
+            if who and earlier and who not in earlier and pc.get("provenance_consistent") is not True and age_days(cur) <= 90:
                 add("medium", "NEW_PUBLISHER",
-                    f"version {tv} was published by '{who}', who published none of the earlier releases (earlier publishers: {', '.join(sorted(earlier))}), and it carries no build provenance: a maintainer handover or a stolen token looks like this")
+                    f"version {tv} was published by '{who}', who published none of the earlier releases (earlier publishers: {', '.join(sorted(earlier))}), and it has {_prov_phrase(pc)}: a maintainer handover or a stolen token looks like this")
+    pc = info.get("provenance_check") or {}
+    if pc.get("attestation_present"):
+        if pc.get("digest_matches") is False:
+            add("high", "PROVENANCE_DIGEST_MISMATCH", "the build attestation does not describe the published tarball (its digest differs from the registry's)")
+        if pc.get("repository_matches") is False:
+            add("medium", "PROVENANCE_REPO_MISMATCH", f"the build attestation names a different source repository ({pc.get('workflow_repository')}) than the one the package declares")
+        if pc.get("provenance_consistent") is True:
+            add("info", "PROVENANCE_NOT_SIGNATURE_VERIFIED", "a build attestation is present and consistent with the tarball and repository, but its signature chain was NOT verified by this tool (run `npm audit signatures` after installing)")
+        elif pc.get("provenance_consistent") is None:
+            add("info", "PROVENANCE_UNCHECKED", f"a build attestation is present but could not be checked: {pc.get('issue')}")
     if not name.isascii():
         add("medium", "NON_ASCII_NAME", "the name contains non-ASCII characters (possible homoglyph attack)")
     raw = name.lower().split("/")[-1]
@@ -600,6 +714,8 @@ def check(eco, name, repo=True, version=None):
                    note="Never suggest registering the name. Registry search results are NOT verified: run each one through the same process.")
         return res, 1
     gh = gh_check(info, eco, name) if repo else {"status": "skipped", "note": "repository check disabled (--no-repo)"}
+    if eco == "npm":
+        info["provenance_check"] = provenance_check(info, version or info.get("version"))
     flags = evaluate(eco, name, info, gh, target_version=version)
     signals = ("strong_alerts" if any(f["level"] == "high" for f in flags)
                else "attention" if any(f["level"] == "medium" for f in flags) else "no_alerts")
@@ -609,8 +725,8 @@ def check(eco, name, repo=True, version=None):
     info["target_version"], info["target_published"] = tv, iso(cur)
     info["previous_release"] = iso(prev)
     info["target_publisher"] = (info.get("publishers") or {}).get(tv)
-    info["target_provenance"] = (info.get("provenance") or {}).get(tv)
-    for k in ("release_times", "publishers", "provenance"):
+    info["target_provenance"] = info.get("provenance_check")
+    for k in ("release_times", "publishers", "attestation_urls", "integrity", "provenance_check"):
         info.pop(k, None)
     info["created"], info["modified"] = iso(to_dt(info.get("created"))), iso(to_dt(info.get("modified")))
     info.pop("repo_dir", None)

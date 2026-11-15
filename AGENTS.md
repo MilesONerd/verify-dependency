@@ -50,8 +50,11 @@ Run the offline tests and `tools/package.py` before every commit.
 - Do not remove existing checks. Adding a flag means adding a test and a row in the flag table in `SKILL.md`.
 - Flag levels: `high` and `medium` change `signals`; `maintenance` and `info` do not.
 - The audit surface is deliberate: a new host, import, subprocess or file write requires a conscious edit of the allowlists in
-  `tests/test_audit_surface.py`. Never loosen those tests just to make a change pass, and never fetch a URL taken from package metadata unless
-  its host is on a fixed allowlist.
+  `tests/test_audit_surface.py` and `FETCH_HOSTS` in `check_dep.py` (they must stay equal). Never loosen those tests just to make a change
+  pass. All HTTP goes through `get()` and its guarded opener; never call `urlopen`, never fetch a URL taken from package metadata unless its host is
+  on the allowlist, and never follow a redirect to another host.
+- Provenance has three levels (`attestation_present`, `provenance_consistent`, `provenance_verified`). `provenance_verified` stays `false` unless
+  the signature chain is really verified; never present "present" or "consistent" as "verified".
 
 ## Invariants of the skill (do not weaken)
 

@@ -71,10 +71,15 @@ machine. Treat this one like any other dependency, which is the whole point of i
 - **Read it.** `SKILL.md` is about 185 lines and the two scripts use only the Python standard library.
 - **Pin it.** Install from a tagged release or a commit hash, not from a moving branch. `python3 tools/package.py` prints the SHA-256 of
   `verify-dependency.skill` and writes it next to the file; compare it with the one published with the release.
-- **Let the tests check the surface.** `tests/test_audit_surface.py` fails if the scripts start to contact a host outside an audited list,
-  import anything unexpected, use `eval`/`exec`/`os.system`, delete or write files, run anything other than `git`, or fetch a URL chosen
-  by a package (repository links from package metadata are fetched from `github.com` only). It also fails if `SKILL.md` gains phrases that
-  tell an agent to hide output or skip the approval. The hosts contacted are the package registries (npm, PyPI, crates.io, RubyGems,
+- **The network is guarded at runtime, not only by tests.** Every request goes through one opener that refuses any host outside a fixed
+  allowlist, anything that is not https, and any redirect to another host (a package's own metadata can point anywhere, so a URL taken from it
+  never decides where the script connects). `tests/test_network_guard.py` checks this with real sockets and with a recording opener across all
+  eleven ecosystems.
+- **Let the tests check the surface.** `tests/test_audit_surface.py` fails if the scripts start to import anything unexpected, use dynamic code or
+  reflection, write, rename or delete files by any route (`open`, `os.*`, `urlretrieve`, `pathlib`-style writers), modify the environment,
+  run anything other than read-only `git` commands, or use an unguarded opener. It resolves import aliases, so `import os as x` does not hide a
+  call. It also fails if `SKILL.md` gains phrases that tell an agent to hide output or skip the approval. Static analysis cannot prove a
+  script safe; it makes the usual ways of going wrong fail loudly. The hosts contacted are the package registries (npm, PyPI, crates.io, RubyGems,
   NuGet, Go proxy, Packagist, Hex, pub.dev, Maven Central, AUR) plus `api.github.com`, `raw.githubusercontent.com` and `github.com`.
 - **Review every change or fork.** Look for instructions that weaken the approval rule or the report, new hosts, new imports, obfuscated or
   encoded strings, and anything that executes what it downloads. The tests catch some of this; they do not replace reading the diff.
@@ -114,6 +119,10 @@ rate limit (60 requests per hour when anonymous).
 - **Account compromise is only partly covered.** The dormant-package and new-publisher checks catch two patterns. A hijacked maintainer account
   publishing a new version of an actively maintained package looks normal to every signal here. Pin versions, prefer packages with build
   provenance, and delay adopting brand-new versions when you can.
+- **Build provenance is checked for consistency, not verified.** For npm the script compares the attestation's digest with the published tarball
+  and its source repository with the declared one. It does not verify the Sigstore signature chain (the standard library cannot), so the result
+  is "present and consistent", never "verified". `npm audit signatures` verifies signatures after installation. Even verified provenance only
+  says where a build ran, not that the code is benign.
 - **Repository cross-checks cover GitHub only.** Repositories on GitLab, Codeberg, SourceHut and self-hosted forges get an informational
   `REPO_UNVERIFIED`. Fetching them would need per-forge APIs and a strict host allowlist, because the URL comes from the package's own metadata.
 - **GitHub rate limits.** `diff_lock.py --verify` makes no GitHub requests (measured: 0 for a 65-package tree); it queries registries only.
